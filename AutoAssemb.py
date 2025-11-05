@@ -1,8 +1,9 @@
+import argparse
 import subprocess
 import os
 from bs4 import BeautifulSoup
 
-def create_config_file(srr_id, sequence_length, config_path='config.txt'):
+def create_config_file(srr_id, sequence_length, config_path, seed_path, refseq_path, output_path):
     config_content = f"""Project:
 -----------------------
 Project name          = {srr_id}_mito
@@ -12,9 +13,9 @@ K-mer                 = 25
 Max memory            =
 Extended log          = 0
 Save assembled reads  = no
-Seed Input            = /home/labpc1/seed.fasta
+Seed Input            = {seed_path}
 Extend seed directly  = no
-Reference sequence    = /home/labpc1/L757_Mito_Ref.fasta
+Reference sequence    = {refseq_path}
 Variance detection    =
 Chloroplast sequence  =
 
@@ -25,8 +26,8 @@ Insert size           = 300
 Platform              = illumina
 Single/Paired         = PE
 Combined reads        =
-Forward reads         = /home/labpc1/{srr_id}_1.fastq
-Reverse reads         = /home/labpc1/{srr_id}_2.fastq
+Forward reads         = {os.path.join(output_path, srr_id)}_1.fastq
+Reverse reads         = {os.path.join(output_path, srr_id)}_2.fastq
 Store Hash            =
 
 Heteroplasmy:
@@ -40,7 +41,7 @@ Optional:
 Insert size auto      = yes
 Use Quality Scores    = no
 Reduce ambigious N's  =
-Output path           = /media/labpc1/MARIANA_2/Q30/Candida_Assembly/{srr_id}/NOVOPlasty/
+Output path           = {os.path.join(output_path, srr_id, 'NOVOPlasty')}
 """
     with open(config_path, 'w') as file:
         file.write(config_content)
@@ -56,114 +57,126 @@ def extract_sequence_length(html_file):
         length_tag = sequence_length_tag.find_next('td')
         sequence_length = length_tag.text.strip()
 
-        # Check if the length contains a hyphen
+        # Handle hyphen cases
         if '-' in sequence_length:
-            # Split the string and take the second part
             sequence_length = sequence_length.split('-')[1].strip()
 
-        sequence_length = int(sequence_length)  # Convert to integer for FLASH
+        sequence_length = int(sequence_length)
     else:
         sequence_length = None
 
     return sequence_length
 
-def log_skipped_srr(srr_id, reason, log_file='skipped_srr_ids.txt'):
+def log_skipped_srr(srr_id, reason, log_file):
     with open(log_file, 'a') as file:
         file.write(f"{srr_id} skipped: {reason}\n")
 
 def main():
-    # Read SRR IDs from the text file
-    with open('SRR_list.txt', 'r') as file:
-        srr_ids = [line.strip() for line in file if line.strip()]  # Read non-empty lines
+    parser = argparse.ArgumentParser(description='AutoAssemb user-friendly pipeline')
+    parser.add_argument('--srr-list', required=True, help='File with SRR IDs and isolate names (one per line, comma separated: SRR,ID)')
+    parser.add_argument('--output-dir', required=True, help='Directory for output and final results')
+    parser.add_argument('--work-dir', required=True, help='Working directory for temp/intermediate files')
+    parser.add_argument('--seed-file', required=True, help='Path to seed FASTA')
+    parser.add_argument('--refseq-file', required=True, help='Path to reference FASTA')
+    parser.add_argument('--log-file', default='skipped_srr_ids.txt', help='Log file for skipped SRRs')
+    args = parser.parse_args()
 
-    for srr_id in srr_ids:
-        print(f"Processing SRR ID: {srr_id}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.work_dir, exist_ok=True)
 
-        # Run prefetch command
-        result = subprocess.run(['prefetch', srr_id])
+    with open(args.srr_list, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    srr_entries = [line.split(',') for line in lines]
+
+    for srr_id, isolate_id in srr_entries:
+        print(f"\nProcessing: SRR ID: {srr_id}, Isolate ID: {isolate_id}")
+
+        # All temp files go to the working dir!
+        wdir = args.work_dir
+        outdir = os.path.join(args.output_dir, isolate_id)
+        novoplasty_dir = os.path.join(outdir, "NOVOPlasty")
+        os.makedirs(outdir, exist_ok=True)
+        os.makedirs(novoplasty_dir, exist_ok=True)
+
+        fq1 = os.path.join(wdir, f'{srr_id}_1.fastq')
+        fq2 = os.path.join(wdir, f'{srr_id}_2.fastq')
+
+        # 1. Prefetch, 2. fastq-dump, 3. FastQC
+        result = subprocess.run(['prefetch', srr_id], cwd=wdir)
         if result.returncode != 0:
-            print(f"Error downloading {srr_id} with prefetch. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "prefetch failed")
+            print(f"Error prefetch {srr_id}")
+            log_skipped_srr(srr_id, f"prefetch failed", args.log_file)
             continue
 
-        # Run fastq-dump command
-        result = subprocess.run(['fastq-dump', '--split-3', srr_id])
-        if result.returncode != 0 or not (os.path.exists(f'{srr_id}_1.fastq') and os.path.exists(f'{srr_id}_2.fastq')):
-            print(f"Error running fastq-dump for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "fastq-dump failed")
+        result = subprocess.run(['fastq-dump', '--split-3', srr_id], cwd=wdir)
+        if result.returncode != 0 or not (os.path.exists(fq1) and os.path.exists(fq2)):
+            print(f"Error fastq-dump {srr_id}")
+            log_skipped_srr(srr_id, f"fastq-dump failed", args.log_file)
             continue
 
-        # Run FastQC command
-        result = subprocess.run(['fastqc', '-t', '10', f'{srr_id}_1.fastq', f'{srr_id}_2.fastq'])
-        if result.returncode != 0 or not os.path.exists(f'{srr_id}_1_fastqc.html'):
-            print(f"Error running FastQC for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "FastQC failed")
+        result = subprocess.run(['fastqc', '-t', '10', fq1, fq2], cwd=wdir)
+        fq1_fastqc = os.path.join(wdir, f'{srr_id}_1_fastqc.html')
+        if result.returncode != 0 or not os.path.exists(fq1_fastqc):
+            print(f"Error FastQC {srr_id}")
+            log_skipped_srr(srr_id, f"FastQC failed", args.log_file)
             continue
 
-        # Extract sequence length from the FastQC HTML file
-        sequence_length = extract_sequence_length(f'{srr_id}_1_fastqc.html')
+        sequence_length = extract_sequence_length(fq1_fastqc)
         if sequence_length is None:
-            print(f"Failed to extract sequence length for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "Failed to extract sequence length")
+            print(f"Failed to extract sequence length {srr_id}")
+            log_skipped_srr(srr_id, f"Failed to extract sequence length", args.log_file)
             continue
 
         # Run TrimGalore
-        result = subprocess.run(['trim_galore', '--paired', '-q', '30', '--length', '20', '-j', '4', f'{srr_id}_1.fastq', f'{srr_id}_2.fastq'])
+        result = subprocess.run(['trim_galore', '--paired', '-q', '30', '--length', '20', '-j', '4', fq1, fq2], cwd=wdir)
+        fq1_val = os.path.join(wdir, f'{srr_id}_1_val_1.fq')
+        fq2_val = os.path.join(wdir, f'{srr_id}_2_val_2.fq')
         if result.returncode != 0:
-            print(f"Error running TrimGalore for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "TrimGalore failed")
+            print(f"Error TrimGalore {srr_id}")
+            log_skipped_srr(srr_id, f"TrimGalore failed", args.log_file)
             continue
 
-        # Run FLASH
-        result = subprocess.run(['flash', '-m', '25', '-M', str(sequence_length), '-o', f'flash_{srr_id}', f'{srr_id}_1_val_1.fq', f'{srr_id}_2_val_2.fq'])
+        # FLASH
+        result = subprocess.run(['flash', '-m', '25', '-M', str(sequence_length), '-o', f'flash_{srr_id}', fq1_val, fq2_val], cwd=wdir)
         if result.returncode != 0:
-            print(f"Error running FLASH for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "FLASH failed")
+            print(f"Error FLASH {srr_id}")
+            log_skipped_srr(srr_id, f"FLASH failed", args.log_file)
             continue
 
-        # Run SPAdes
-        result = subprocess.run(['spades.py', '-1', f'flash_{srr_id}.notCombined_1.fastq', '-2', f'flash_{srr_id}.notCombined_2.fastq', '--merged', f'flash_{srr_id}.extendedFrags.fastq', '-o', f'{srr_id}_q30_genome'])
+        # SPAdes
+        result = subprocess.run(
+            ['spades.py', '-1', f'flash_{srr_id}.notCombined_1.fastq', '-2', f'flash_{srr_id}.notCombined_2.fastq', '--merged', f'flash_{srr_id}.extendedFrags.fastq', '-o', f'spades_{srr_id}'],
+            cwd=wdir
+        )
         if result.returncode != 0:
-            print(f"Error running SPAdes for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "SPAdes failed")
+            print(f"Error SPAdes {srr_id}")
+            log_skipped_srr(srr_id, f"SPAdes failed", args.log_file)
             continue
 
-        # Run NOVOPlasty
-        # Create config file for NOVOPlasty
-        # Create directories if they don't exist
-        output_directory_1 = f'/media/labpc1/MARIANA_2/Q30/Candida_Assembly/{srr_id}/NOVOPlasty/'
-        os.makedirs(output_directory_1, exist_ok=True)
-        create_config_file(srr_id, sequence_length)
-
-        result = subprocess.run(['NOVOPlasty4.3.5.pl', '-c', 'config.txt'])
+        # NOVOPlasty config and run
+        config_path = os.path.join(wdir, f'config_{srr_id}.txt')
+        create_config_file(srr_id, sequence_length, config_path, args.seed_file, args.refseq_file, outdir)
+        result = subprocess.run(['NOVOPlasty4.3.5.pl', '-c', config_path], cwd=wdir)
         if result.returncode != 0:
-            print(f"Error running NOVOPlasty for {srr_id}. Skipping to next SRR ID.")
-            log_skipped_srr(srr_id, "NOVOPlasty failed")
+            print(f"Error NOVOPlasty {srr_id}")
+            log_skipped_srr(srr_id, f"NOVOPlasty failed", args.log_file)
             continue
 
-        # Remove unnecessary files
-        files_to_remove = [
-            f'{srr_id}_1.fastq', f'{srr_id}_2.fastq', f'flash_{srr_id}.notCombined_1.fastq',
-            f'flash_{srr_id}.notCombined_2.fastq', f'{srr_id}_1_val_1.fq', f'{srr_id}_2_val_2.fq',
-            f'flash_{srr_id}.extendedFrags.fastq', f'flash_{srr_id}.hist', f'flash_{srr_id}.histogram',
-            f'sra-toolkit/sra/{srr_id}.sra', f'{srr_id}_1_fastqc.zip', f'{srr_id}_2_fastqc.zip'
+        # Move outputs to output directory
+        files_to_copy = [
+            f'{srr_id}_q30_genome',
+            f'{srr_id}_1.fastq_trimming_report.txt',
+            f'{srr_id}_2.fastq_trimming_report.txt',
+            f'{srr_id}_1_fastqc.html',
+            f'{srr_id}_2_fastqc.html',
+            # Add more outputs as needed
         ]
-        for file in files_to_remove:
-            subprocess.run(['rm', file])
+        for file in files_to_copy:
+            src = os.path.join(wdir, file)
+            dst = os.path.join(outdir, file)
+            if os.path.exists(src):
+                os.rename(src, dst)
+        print(f"Finished {srr_id}")
 
-        # Create directories if they don't exist
-        output_directory_2 = f'/media/labpc1/MARIANA_2/Q30/Candida_Assembly/{srr_id}/'
-        os.makedirs(output_directory_2, exist_ok=True)
-
-        # Move files to MARIANA_2 external drive
-        files_to_move = [
-            f'{srr_id}_q30_genome', f'{srr_id}_1.fastq_trimming_report.txt',
-            f'{srr_id}_2.fastq_trimming_report.txt', f'{srr_id}_1_fastqc.html',
-            f'{srr_id}_2_fastqc.html', f'{srr_id}_GenoSplit'
-        ]
-        for file in files_to_move:
-            subprocess.run(['mv', file, output_directory_2])
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
